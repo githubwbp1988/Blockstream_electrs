@@ -29,6 +29,7 @@ otlp-tracing = [
 bitcoind_28_0 = []
 
 [dependencies]
+chrono = "0.4"
 arraydeque = "0.5.1"
 arrayref = "0.3.6"
 base64 = "0.22"

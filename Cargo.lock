@@ -896,6 +896,7 @@ dependencies = [
  "bitcoin 0.32.5",
  "bitcoin-test-data",
  "bitcoind",
+ "chrono",
  "clap 2.34.0",
  "criterion",
  "crossbeam-channel",

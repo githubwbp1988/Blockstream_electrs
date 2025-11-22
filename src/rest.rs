@@ -33,9 +33,39 @@ use {
     elements::{encode, secp256k1_zkp as zkp, AssetId},
 };
 
-use serde::Serialize;
+use serde::{Serialize, Deserialize};
+// --- Bitcoin Address & Transaction Flow Graph API ---
+#[derive(Serialize, Deserialize)]
+struct AddressNode {
+    id: String,
+    label: String,
+    balance: f64,
+    txCount: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TxEdge {
+    source: String,
+    target: String,
+    transactions: Vec<TxInfo>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct TxInfo {
+    id: String,
+    amount: f64,
+    time: i64,
+    confirms: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TxFlowGraph {
+    addresses: Vec<AddressNode>,
+    edges: Vec<TxEdge>,
+}
 use serde_json;
-use std::collections::HashMap;
+use chrono;
+use std::collections::{HashMap, BTreeSet};
 use std::num::ParseIntError;
 use std::os::unix::fs::FileTypeExt;
 use std::sync::Arc;
@@ -644,6 +674,161 @@ fn handle_request(
             TTL_SHORT,
         ),
 
+        // (&Method::GET, Some(&"tx_flow"), None, None, None, None) => http_message(
+        //     StatusCode::OK,
+        //     "return tx flow",
+        //     TTL_SHORT,
+        // ),
+        // --- Bitcoin Address & Transaction Flow Graph API (real data from chain + mempool) ---
+        (&Method::GET, Some(&"tx_flow"), None, None, None, None) => {
+            let mut edges_map: HashMap<(String, String), Vec<TxInfo>> = HashMap::new();
+            let mut addr_set: HashMap<String, (u64, u32)> = HashMap::new(); // addr -> (balance_sats, tx_count)
+
+            let best_height = query.chain().best_height();
+            let start_height = 0;
+
+            // scan confirmed blocks
+            for height in start_height..=best_height {
+                if let Some(header_entry) = query.chain().header_by_height(height) {
+                    let hash = *header_entry.hash();
+                    let block_time = header_entry.header().time as i64;
+                    if let Some(txids) = query.chain().get_block_txids(&hash) {
+                        for txid in txids.into_iter() {
+                            if let Some(tx) = query.lookup_txn(&txid) {
+                                // lookup prevouts for inputs
+                                let outpoints: BTreeSet<OutPoint> = tx
+                                    .input
+                                    .iter()
+                                    .filter(|txin| has_prevout(txin))
+                                    .map(|txin| txin.previous_output)
+                                    .collect();
+
+                                let prevouts = query.lookup_txos(outpoints);
+
+                                // collect source addresses from prevouts (may be empty for coinbase)
+                                let mut sources: Vec<String> = Vec::new();
+                                for txin in tx.input.iter() {
+                                    if let Some(prev) = prevouts.get(&txin.previous_output) {
+                                        if let Some(src_addr) = prev.script_pubkey.to_address_str(config.network_type) {
+                                            sources.push(src_addr);
+                                        }
+                                    }
+                                }
+
+                                // for each output, create edges from each source to this output address
+                                for txout in tx.output.iter() {
+                                    if let Some(tgt_addr) = txout.script_pubkey.to_address_str(config.network_type) {
+                                        // amount in BTC (approx)
+                                        #[cfg(not(feature = "liquid"))]
+                                        let amount_btc = txout.value.to_sat() as f64 / 1e8;
+                                        #[cfg(feature = "liquid")]
+                                        let amount_btc = txout.value.explicit().map(|v| v as f64 / 1e8).unwrap_or(0.0);
+
+                                        let confirms = (best_height - height + 1) as u32;
+
+                                        let txinfo = TxInfo { id: txid.to_string(), amount: amount_btc, time: block_time, confirms };
+
+                                        if sources.is_empty() {
+                                            // coinbase or unknown source -> use special source label
+                                            let src = "coinbase".to_string();
+                                            edges_map.entry((src.clone(), tgt_addr.clone())).or_insert_with(Vec::new).push(txinfo.clone());
+                                            // track addr stats
+                                            let entry = addr_set.entry(tgt_addr.clone()).or_insert((0u64, 0u32));
+                                            entry.1 = entry.1.saturating_add(1);
+                                        } else {
+                                            for src in sources.iter() {
+                                                edges_map.entry((src.clone(), tgt_addr.clone())).or_insert_with(Vec::new).push(txinfo.clone());
+                                                // track stats for source and target
+                                                addr_set.entry(src.clone()).or_insert((0u64, 0u32)).1 = addr_set.get(src).map(|e| e.1).unwrap_or(0).saturating_add(1);
+                                                addr_set.entry(tgt_addr.clone()).or_insert((0u64, 0u32)).1 = addr_set.get(&tgt_addr).map(|e| e.1).unwrap_or(0).saturating_add(1);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // include mempool transactions (unconfirmed)
+            let now_ts = chrono::Utc::now().timestamp();
+            let mempool = query.mempool();
+            let mempool_txids: Vec<_> = mempool.txids().iter().cloned().collect();
+            for txid in mempool_txids.into_iter() {
+                if let Some(tx) = query.lookup_txn(&txid) {
+                    let outpoints: BTreeSet<OutPoint> = tx
+                        .input
+                        .iter()
+                        .filter(|txin| has_prevout(txin))
+                        .map(|txin| txin.previous_output)
+                        .collect();
+                    let prevouts = query.lookup_txos(outpoints);
+                    let mut sources: Vec<String> = Vec::new();
+                    for txin in tx.input.iter() {
+                        if let Some(prev) = prevouts.get(&txin.previous_output) {
+                            if let Some(src_addr) = prev.script_pubkey.to_address_str(config.network_type) {
+                                sources.push(src_addr);
+                            }
+                        }
+                    }
+                    for txout in tx.output.iter() {
+                        if let Some(tgt_addr) = txout.script_pubkey.to_address_str(config.network_type) {
+                            #[cfg(not(feature = "liquid"))]
+                            let amount_btc = txout.value.to_sat() as f64 / 1e8;
+                            #[cfg(feature = "liquid")]
+                            let amount_btc = txout.value.explicit().map(|v| v as f64 / 1e8).unwrap_or(0.0);
+
+                            let txinfo = TxInfo { id: txid.to_string(), amount: amount_btc, time: now_ts, confirms: 0 };
+                            if sources.is_empty() {
+                                let src = "mempool_unknown".to_string();
+                                edges_map.entry((src.clone(), tgt_addr.clone())).or_insert_with(Vec::new).push(txinfo.clone());
+                                addr_set.entry(tgt_addr.clone()).or_insert((0u64, 0u32)).1 = addr_set.get(&tgt_addr).map(|e| e.1).unwrap_or(0).saturating_add(1);
+                            } else {
+                                for src in sources.iter() {
+                                    edges_map.entry((src.clone(), tgt_addr.clone())).or_insert_with(Vec::new).push(txinfo.clone());
+                                    addr_set.entry(src.clone()).or_insert((0u64, 0u32)).1 = addr_set.get(src).map(|e| e.1).unwrap_or(0).saturating_add(1);
+                                    addr_set.entry(tgt_addr.clone()).or_insert((0u64, 0u32)).1 = addr_set.get(&tgt_addr).map(|e| e.1).unwrap_or(0).saturating_add(1);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // build AddressNode list using stats from index where possible
+            let mut addresses: Vec<AddressNode> = Vec::new();
+            for (addr_str, (_bal_sats, txcount)) in addr_set.iter() {
+                // attempt to get chain stats for balance
+                let balance_btc = match address_to_scripthash(addr_str, config.network_type) {
+                    Ok(scripthash) => {
+                        let stats = query.stats(&scripthash[..]);
+                        #[cfg(not(feature = "liquid"))]
+                        {
+                            let chain_sum = stats.0.funded_txo_sum as f64 / 1e8;
+                            let mempool_sum = stats.1.funded_txo_sum as f64 / 1e8;
+                            chain_sum + mempool_sum
+                        }
+                        #[cfg(feature = "liquid")]
+                        {
+                            0.0
+                        }
+                    }
+                    Err(_) => 0.0,
+                };
+                addresses.push(AddressNode { id: addr_str.clone(), label: addr_str.clone(), balance: balance_btc, txCount: *txcount });
+            }
+
+            // build edges vector
+            let mut edges: Vec<TxEdge> = Vec::new();
+            for ((src, tgt), txs) in edges_map.into_iter() {
+                edges.push(TxEdge { source: src, target: tgt, transactions: txs });
+            }
+
+            let graph = TxFlowGraph { addresses, edges };
+            json_response(graph, TTL_SHORT)
+        }
+
         (&Method::GET, Some(&"blocks"), start_height, None, None, None) => {
             let start_height = start_height.and_then(|height| height.parse::<usize>().ok());
             blocks(&query, start_height)
@@ -1236,6 +1421,8 @@ fn json_response<T: Serialize>(value: T, ttl: u32) -> Result<Response<Body>, Htt
         .body(Body::from(value))
         .unwrap())
 }
+
+
 
 #[trace]
 fn blocks(query: &Query, start_height: Option<usize>) -> Result<Response<Body>, HttpError> {
